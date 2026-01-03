@@ -1,10 +1,13 @@
-import React, { useState, useEffect } from 'react';
+
+import React, { useState, useEffect, useRef } from 'react';
 import Header from './components/Header';
 import Recorder from './components/Recorder';
 import Results from './components/Results';
 import { AppState, MeetingData, ProcessingMode, GeminiModel } from './types';
 import { processMeetingAudio } from './services/geminiService';
 import { initDrive, connectToDrive, uploadAudioToDrive, uploadTextToDrive, disconnectDrive } from './services/driveService';
+import { saveChunkToDB, getChunksForSession, getPendingSessions, deleteSessionData } from './services/db';
+import { AlertCircle, RotateCcw } from 'lucide-react';
 
 const App: React.FC = () => {
   const [appState, setAppState] = useState<AppState>(AppState.IDLE);
@@ -15,13 +18,19 @@ const App: React.FC = () => {
   const [meetingData, setMeetingData] = useState<MeetingData | null>(null);
   const [error, setError] = useState<string | null>(null);
   
-  const [audioChunks, setAudioChunks] = useState<Blob[]>([]);
+  // FIX: Use useRef for audio chunks to avoid massive re-renders and memory leaks
+  const audioChunksRef = useRef<Blob[]>([]);
+  const sessionIdRef = useRef<string>(`session_${Date.now()}`);
+  
   const [combinedBlob, setCombinedBlob] = useState<Blob | null>(null);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   
   const [isDriveConnected, setIsDriveConnected] = useState(false);
   const [debugLogs, setDebugLogs] = useState<string[]>([]);
   const [sessionStartTime, setSessionStartTime] = useState<Date | null>(null);
+  
+  // Recovery State
+  const [recoverableSession, setRecoverableSession] = useState<{sessionId: string, title: string} | null>(null);
 
   const addLog = (msg: string) => {
     setDebugLogs(prev => [...prev, `${new Date().toLocaleTimeString('en-GB')} - ${msg}`]);
@@ -41,6 +50,15 @@ const App: React.FC = () => {
   };
 
   useEffect(() => {
+    // Check for recoverable sessions on mount
+    const checkRecovery = async () => {
+        const sessions = await getPendingSessions();
+        if (sessions.length > 0) {
+            setRecoverableSession(sessions[0]);
+        }
+    };
+    checkRecovery();
+
     const timer = setTimeout(() => {
       initDrive((token) => {
           if (token) {
@@ -73,23 +91,30 @@ const App: React.FC = () => {
     addLog("Drive disconnected.");
   };
 
-  useEffect(() => {
-    if (audioChunks.length > 0) {
-      const mimeType = audioChunks[0].type || 'audio/webm';
-      const blob = new Blob(audioChunks, { type: mimeType });
+  const handleChunkReady = (chunk: Blob) => {
+    audioChunksRef.current.push(chunk);
+    
+    // Persistent backup to IndexedDB for crash recovery
+    saveChunkToDB({
+        sessionId: sessionIdRef.current,
+        index: audioChunksRef.current.length,
+        chunk: chunk,
+        timestamp: Date.now()
+    }).catch(err => console.error("Failed to save chunk to DB:", err));
+  };
+
+  const finalizeAudio = () => {
+    if (audioChunksRef.current.length > 0) {
+      const mimeType = audioChunksRef.current[0].type || 'audio/webm';
+      const blob = new Blob(audioChunksRef.current, { type: mimeType });
       setCombinedBlob(blob);
       const url = URL.createObjectURL(blob);
       setAudioUrl(url);
-      return () => URL.revokeObjectURL(url);
     }
-  }, [audioChunks]);
-
-  const handleChunkReady = (chunk: Blob) => {
-    setAudioChunks(prev => [...prev, chunk]);
   };
 
   const handleFileUpload = (file: File) => {
-      setAudioChunks([]); 
+      audioChunksRef.current = [];
       setCombinedBlob(file);
       const url = URL.createObjectURL(file);
       setAudioUrl(url);
@@ -103,13 +128,45 @@ const App: React.FC = () => {
 
   const handleRecordingChange = (isRecording: boolean) => {
     if (isRecording) {
+      // Starting fresh
+      sessionIdRef.current = `session_${Date.now()}`;
+      audioChunksRef.current = [];
       setSessionStartTime(new Date());
       setAppState(AppState.RECORDING);
+      setRecoverableSession(null); // Clear recovery prompt if user starts a new one
     } else {
        if (appState === AppState.RECORDING) {
          setAppState(AppState.PAUSED);
+         finalizeAudio(); // Glue audio only when recording stops
        }
     }
+  };
+
+  const restoreSession = async () => {
+      if (!recoverableSession) return;
+      addLog("Restoring session from backup...");
+      try {
+          const chunks = await getChunksForSession(recoverableSession.sessionId);
+          if (chunks.length > 0) {
+              audioChunksRef.current = chunks;
+              sessionIdRef.current = recoverableSession.sessionId;
+              setTitle(recoverableSession.title || "");
+              finalizeAudio();
+              setAppState(AppState.PAUSED);
+              setRecoverableSession(null);
+              addLog(`Restored ${chunks.length} segments.`);
+          }
+      } catch (err) {
+          addLog("Restoration failed.");
+          setRecoverableSession(null);
+      }
+  };
+
+  const discardRecovery = async () => {
+      if (recoverableSession) {
+          await deleteSessionData(recoverableSession.sessionId);
+          setRecoverableSession(null);
+      }
   };
 
   const autoSyncToDrive = async (data: MeetingData, currentTitle: string, blob: Blob | null) => {
@@ -124,16 +181,11 @@ const App: React.FC = () => {
     addLog(`Cloud Storage: Syncing...`);
 
     if (blob) {
-      // Determine extension based on mime type to ensure Drive files are downloadable and recognized
       let ext = 'webm';
       const type = blob.type.toLowerCase();
       if (type.includes('mp4') || type.includes('m4a')) ext = 'm4a';
       else if (type.includes('wav')) ext = 'wav';
       else if (type.includes('mp3')) ext = 'mp3';
-      else if (type.includes('aac')) ext = 'aac';
-      else if (type.includes('flac')) ext = 'flac';
-      else if (type.includes('ogg')) ext = 'ogg';
-
       const audioName = `${safeBaseName} - audio.${ext}`;
       uploadAudioToDrive(audioName, blob).catch(() => {});
     }
@@ -143,15 +195,12 @@ const App: React.FC = () => {
       let notesMarkdown = `# ${cleanTitle} notes\n`;
       notesMarkdown += `*Recorded on ${dateString}*\n\n`;
       notesMarkdown += `${data.summary.trim()}\n\n`;
-      
       if (data.conclusions && data.conclusions.length > 0) {
           notesMarkdown += `## Conclusions & Insights\n${data.conclusions.map(i => `- ${i}`).join('\n')}\n`;
       }
-      
       if (data.actionItems && data.actionItems.length > 0) {
           notesMarkdown += `\n## Action Items${data.actionItems.map(i => `- ${i}`).join('\n')}`;
       }
-
       uploadTextToDrive(notesName, notesMarkdown, 'Notes').catch(() => {});
     }
 
@@ -179,6 +228,9 @@ const App: React.FC = () => {
       setMeetingData(newData);
       setAppState(AppState.COMPLETED);
 
+      // Processing complete: Clear backup
+      deleteSessionData(sessionIdRef.current).catch(() => {});
+
       if (isDriveConnected) {
         autoSyncToDrive(newData, finalTitle, combinedBlob);
       }
@@ -189,10 +241,14 @@ const App: React.FC = () => {
     }
   };
 
-  const handleDiscard = () => {
+  const handleDiscard = async () => {
+    // Clear everything
+    await deleteSessionData(sessionIdRef.current);
+    
     setAppState(AppState.IDLE);
-    setAudioChunks([]);
+    audioChunksRef.current = [];
     setCombinedBlob(null);
+    if (audioUrl) URL.revokeObjectURL(audioUrl);
     setAudioUrl(null);
     setMeetingData(null);
     setDebugLogs([]);
@@ -216,6 +272,30 @@ const App: React.FC = () => {
             {error}
           </div>
         )}
+
+        {recoverableSession && appState === AppState.IDLE && (
+            <div className="max-w-lg mx-auto mb-8 bg-blue-600 text-white p-4 rounded-2xl shadow-lg flex items-center justify-between animate-in slide-in-from-top-4 duration-500">
+                <div className="flex items-center gap-3">
+                    <div className="bg-blue-500 p-2 rounded-full">
+                        <AlertCircle className="w-5 h-5 text-white" />
+                    </div>
+                    <div>
+                        <p className="font-bold text-sm">Unsaved session found!</p>
+                        <p className="text-xs text-blue-100 opacity-90 italic">"{recoverableSession.title || 'Untitled'}"</p>
+                    </div>
+                </div>
+                <div className="flex gap-2">
+                    <button onClick={restoreSession} className="bg-white text-blue-600 px-3 py-1.5 rounded-lg text-xs font-bold hover:bg-blue-50 transition-colors flex items-center gap-1">
+                        <RotateCcw className="w-3 h-3" />
+                        Restore
+                    </button>
+                    <button onClick={discardRecovery} className="bg-blue-700 text-blue-200 px-3 py-1.5 rounded-lg text-xs font-bold hover:bg-blue-800 transition-colors">
+                        Ignore
+                    </button>
+                </div>
+            </div>
+        )}
+
         {appState !== AppState.COMPLETED && (
           <div className="flex flex-col items-center space-y-8 animate-in fade-in duration-500">
             <div className="w-full max-w-lg space-y-2">
@@ -224,7 +304,10 @@ const App: React.FC = () => {
                 type="text"
                 id="title"
                 value={title}
-                onChange={(e) => setTitle(e.target.value)}
+                onChange={(e) => {
+                    setTitle(e.target.value);
+                    localStorage.setItem(`title_${sessionIdRef.current}`, e.target.value);
+                }}
                 placeholder="Meeting Title"
                 className="w-full px-4 py-3 rounded-xl border border-slate-200 shadow-sm focus:ring-2 focus:ring-blue-500 outline-none transition-all"
                 disabled={appState === AppState.PROCESSING || appState === AppState.RECORDING}

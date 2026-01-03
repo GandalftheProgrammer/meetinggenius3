@@ -1,3 +1,4 @@
+
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
@@ -5,8 +6,8 @@ import react from '@vitejs/plugin-react';
 export default defineConfig({
   plugins: [react()],
   define: {
-    // SECURITY: Do NOT expose process.env here. 
-    // Only expose specific safe variables if needed.
-    // The API_KEY will now be hidden in the Netlify backend.
+    // Expose API_KEY to the client for Sandbox/Client-side execution
+    // This allows the app to function even if Netlify backend functions are not deployed
+    'process.env.API_KEY': JSON.stringify(process.env.API_KEY || ""),
   }
 });
