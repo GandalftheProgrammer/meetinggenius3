@@ -105,18 +105,31 @@ const convertMarkdownToHtml = (md: string): string => {
         .replace(/- \[ \] (.*$)/gm, '<li>☐ $1</li>')
         .replace(/- (.*$)/gm, '<li>$1</li>');
 
-    // 2. Wrap consecutive <li> into <ul>
-    html = html.replace(/((?:<li>.*?<\/li>\s*)+)/g, '<ul>$1</ul>');
+    // 2. GLUE LIST ITEMS
+    // IMPORTANT: Remove newlines between list items to ensure they are treated as a single block
+    // This prevents the line-splitter from isolating closing tags like </ul> and wrapping them in <p>
+    html = html.replace(/<\/li>\s+(?=<li)/g, '</li>');
 
-    // 3. Process inline elements
+    // 3. Wrap consecutive <li> into <ul>
+    html = html.replace(/((?:<li>.*?<\/li>)+)/g, '<ul>$1</ul>');
+
+    // 4. Process inline elements
     html = html.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
 
-    // 4. Wrap remaining lines in <p> if they are not already wrapped in a block tag
+    // 5. Wrap remaining lines in <p> if they are not already wrapped in a block tag
     const lines = html.split('\n');
     const processedLines = lines.map(line => {
         const trimmed = line.trim();
         if (!trimmed) return '';
-        if (trimmed.startsWith('<h') || trimmed.startsWith('<ul') || trimmed.startsWith('<li') || trimmed.startsWith('<p')) {
+        
+        // Safety check: Don't wrap lines that are already block tags or closing tags
+        if (
+            trimmed.startsWith('<h') || 
+            trimmed.startsWith('<ul') || 
+            trimmed.startsWith('<li') || 
+            trimmed.startsWith('</ul') || // Critical fix: prevent wrapping isolated closing tags
+            trimmed.startsWith('<p')
+        ) {
             return trimmed;
         }
         return `<p class="body-text">${trimmed}</p>`;
@@ -223,5 +236,11 @@ const uploadFile = async (name: string, content: string | Blob, type: string, su
   return await r.json();
 };
 
-export const uploadAudioToDrive = (name: string, blob: Blob) => uploadFile(name, blob, blob.type, 'Audio', false);
+export const uploadAudioToDrive = (name: string, blob: Blob) => {
+  // Clean the MIME type: 'audio/webm;codecs=opus' -> 'audio/webm'
+  // Google Drive multipart upload rejects the codecs parameter causing 400 Bad Request
+  const cleanType = (blob.type || 'audio/webm').split(';')[0].trim();
+  return uploadFile(name, blob, cleanType, 'Audio', false);
+};
+
 export const uploadTextToDrive = (name: string, content: string, sub: 'Notes' | 'Transcripts') => uploadFile(name, convertMarkdownToHtml(content), 'text/html', sub, true);
