@@ -60,7 +60,6 @@ export const getChunksForSession = async (sessionId: string): Promise<Blob[]> =>
 
     request.onsuccess = () => {
       const results = request.result as AudioChunk[];
-      // Ensure chunks are sorted by timestamp/index
       const sortedChunks = results.sort((a, b) => a.timestamp - b.timestamp).map(r => r.chunk);
       resolve(sortedChunks);
     };
@@ -87,7 +86,6 @@ export const deleteSessionData = async (sessionId: string): Promise<void> => {
     const chunkStore = transaction.objectStore(CHUNK_STORE);
     const sessionStore = transaction.objectStore(SESSION_STORE);
 
-    // Delete all chunks for this session
     const index = chunkStore.index('sessionId');
     const request = index.openCursor(IDBKeyRange.only(sessionId));
 

@@ -18,7 +18,7 @@ const App: React.FC = () => {
   const [meetingData, setMeetingData] = useState<MeetingData | null>(null);
   const [error, setError] = useState<string | null>(null);
   
-  // FIX: Use useRef for audio chunks to avoid massive re-renders and memory leaks
+  // STABILITY FIX: Use useRef for audio chunks to prevent massive re-renders and memory spikes
   const audioChunksRef = useRef<Blob[]>([]);
   const sessionIdRef = useRef<string>(`session_${Date.now()}`);
   
@@ -28,7 +28,7 @@ const App: React.FC = () => {
   const [isDriveConnected, setIsDriveConnected] = useState(false);
   const [debugLogs, setDebugLogs] = useState<string[]>([]);
   const [sessionStartTime, setSessionStartTime] = useState<Date | null>(null);
-  
+
   // Recovery State
   const [recoverableSession, setRecoverableSession] = useState<{sessionId: string, title: string} | null>(null);
 
@@ -50,7 +50,7 @@ const App: React.FC = () => {
   };
 
   useEffect(() => {
-    // Check for recoverable sessions on mount
+    // Check for recoverable sessions on startup
     const checkRecovery = async () => {
         const sessions = await getPendingSessions();
         if (sessions.length > 0) {
@@ -91,18 +91,7 @@ const App: React.FC = () => {
     addLog("Drive disconnected.");
   };
 
-  const handleChunkReady = (chunk: Blob) => {
-    audioChunksRef.current.push(chunk);
-    
-    // Persistent backup to IndexedDB for crash recovery
-    saveChunkToDB({
-        sessionId: sessionIdRef.current,
-        index: audioChunksRef.current.length,
-        chunk: chunk,
-        timestamp: Date.now()
-    }).catch(err => console.error("Failed to save chunk to DB:", err));
-  };
-
+  // STABILITY FIX: Glue audio only when explicitly requested (Stop/Restore)
   const finalizeAudio = () => {
     if (audioChunksRef.current.length > 0) {
       const mimeType = audioChunksRef.current[0].type || 'audio/webm';
@@ -111,6 +100,19 @@ const App: React.FC = () => {
       const url = URL.createObjectURL(blob);
       setAudioUrl(url);
     }
+  };
+
+  const handleChunkReady = (chunk: Blob) => {
+    // Add to lightweight ref
+    audioChunksRef.current.push(chunk);
+    
+    // PERSISTENCE FIX: Save to disk immediately in case of crash
+    saveChunkToDB({
+        sessionId: sessionIdRef.current,
+        index: audioChunksRef.current.length,
+        chunk: chunk,
+        timestamp: Date.now()
+    }).catch(err => console.error("Database save failed:", err));
   };
 
   const handleFileUpload = (file: File) => {
@@ -128,16 +130,16 @@ const App: React.FC = () => {
 
   const handleRecordingChange = (isRecording: boolean) => {
     if (isRecording) {
-      // Starting fresh
+      // Start fresh session
       sessionIdRef.current = `session_${Date.now()}`;
       audioChunksRef.current = [];
       setSessionStartTime(new Date());
       setAppState(AppState.RECORDING);
-      setRecoverableSession(null); // Clear recovery prompt if user starts a new one
+      setRecoverableSession(null);
     } else {
        if (appState === AppState.RECORDING) {
          setAppState(AppState.PAUSED);
-         finalizeAudio(); // Glue audio only when recording stops
+         finalizeAudio(); // Combine only when user is done recording
        }
     }
   };
@@ -154,10 +156,10 @@ const App: React.FC = () => {
               finalizeAudio();
               setAppState(AppState.PAUSED);
               setRecoverableSession(null);
-              addLog(`Restored ${chunks.length} segments.`);
+              addLog(`Successfully restored ${chunks.length} seconds of audio.`);
           }
       } catch (err) {
-          addLog("Restoration failed.");
+          addLog("Restoration error.");
           setRecoverableSession(null);
       }
   };
@@ -186,6 +188,7 @@ const App: React.FC = () => {
       if (type.includes('mp4') || type.includes('m4a')) ext = 'm4a';
       else if (type.includes('wav')) ext = 'wav';
       else if (type.includes('mp3')) ext = 'mp3';
+
       const audioName = `${safeBaseName} - audio.${ext}`;
       uploadAudioToDrive(audioName, blob).catch(() => {});
     }
@@ -195,12 +198,15 @@ const App: React.FC = () => {
       let notesMarkdown = `# ${cleanTitle} notes\n`;
       notesMarkdown += `*Recorded on ${dateString}*\n\n`;
       notesMarkdown += `${data.summary.trim()}\n\n`;
+      
       if (data.conclusions && data.conclusions.length > 0) {
           notesMarkdown += `## Conclusions & Insights\n${data.conclusions.map(i => `- ${i}`).join('\n')}\n`;
       }
+      
       if (data.actionItems && data.actionItems.length > 0) {
           notesMarkdown += `\n## Action Items${data.actionItems.map(i => `- ${i}`).join('\n')}`;
       }
+
       uploadTextToDrive(notesName, notesMarkdown, 'Notes').catch(() => {});
     }
 
@@ -228,7 +234,7 @@ const App: React.FC = () => {
       setMeetingData(newData);
       setAppState(AppState.COMPLETED);
 
-      // Processing complete: Clear backup
+      // Clean up backup after successful processing
       deleteSessionData(sessionIdRef.current).catch(() => {});
 
       if (isDriveConnected) {
@@ -242,7 +248,7 @@ const App: React.FC = () => {
   };
 
   const handleDiscard = async () => {
-    // Clear everything
+    // Clean disk space
     await deleteSessionData(sessionIdRef.current);
     
     setAppState(AppState.IDLE);
@@ -273,6 +279,7 @@ const App: React.FC = () => {
           </div>
         )}
 
+        {/* CRASH RECOVERY UI */}
         {recoverableSession && appState === AppState.IDLE && (
             <div className="max-w-lg mx-auto mb-8 bg-blue-600 text-white p-4 rounded-2xl shadow-lg flex items-center justify-between animate-in slide-in-from-top-4 duration-500">
                 <div className="flex items-center gap-3">
@@ -280,8 +287,8 @@ const App: React.FC = () => {
                         <AlertCircle className="w-5 h-5 text-white" />
                     </div>
                     <div>
-                        <p className="font-bold text-sm">Unsaved session found!</p>
-                        <p className="text-xs text-blue-100 opacity-90 italic">"{recoverableSession.title || 'Untitled'}"</p>
+                        <p className="font-bold text-sm">Session Recovery</p>
+                        <p className="text-xs text-blue-100 opacity-90 italic">"{recoverableSession.title || 'Untitled Meeting'}"</p>
                     </div>
                 </div>
                 <div className="flex gap-2">
